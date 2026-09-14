@@ -110,12 +110,4 @@ void reset() {
   LOGI("Config reset to defaults");
 }
 
-void simulateV1() {
-  ValuesV1 old;
-  old.cfgVersion = 1;
-  old.doubleClickWindowMs = 250;
-  prefs.putBytes(BLOB_KEY, &old, sizeof(old));
-  LOGI("Wrote v1 config to NVS (cfgVersion=1, dblClickMs=250, no txPowerDbm). Reboot to migrate.");
-}
-
 } // namespace Config

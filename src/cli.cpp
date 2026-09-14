@@ -57,8 +57,6 @@ void handleConfig(const String &args) {
     printConfig();
   } else if (subcommand == "reset") {
     Config::reset();
-  } else if (subcommand == "simulate_v1") {
-    Config::simulateV1();
   } else if (subcommand == "set") {
     String rest = args.substring(firstSpace + 1);
     int secondSpace = rest.indexOf(' ');

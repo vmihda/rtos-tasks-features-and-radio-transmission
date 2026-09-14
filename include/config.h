@@ -40,8 +40,4 @@ bool setTxPowerDbm(int8_t value);
 // Erases NVS and reloads defaults.
 void reset();
 
-// Test helper, not part of the released firmware: writes a v1-layout config
-// (no tx_power field) into NVS so a reboot exercises the v1 -> v2 migration.
-void simulateV1();
-
 } // namespace Config
