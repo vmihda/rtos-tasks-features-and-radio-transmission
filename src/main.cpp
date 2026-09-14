@@ -3,6 +3,12 @@
 #include <Wire.h>
 #include <RadioLib.h>
 #include <SSD1306Wire.h>
+#include "version.h"
+#include "log.h"
+#include "cli.h"
+#include "config.h"
+#include "post.h"
+#include "protocol.h"
 
 // ---------- LoRa (SX1276) pins on TTGO LoRa32 V2.1 ----------
 #define LORA_SCK   5
@@ -20,7 +26,9 @@
 // ---------- Button ----------
 #define BUTTON_PIN 4 // external SWT-9 button on breadboard: GPIO4 <-> GND, active LOW via INPUT_PULLUP
 #define DEBOUNCE_MS 30
-#define DOUBLE_CLICK_WINDOW_MS 300
+
+// ---------- Battery ADC ----------
+#define BATTERY_ADC_PIN 35 // on-board battery voltage divider (ADC1, Wi-Fi safe)
 
 enum class ClickType : uint8_t { SINGLE, DOUBLE };
 
@@ -30,7 +38,7 @@ struct ButtonEvent {
 };
 
 struct RadioMessage {
-  char text[32];
+  uint8_t payload; // Protocol::PAYLOAD_SINGLE or PAYLOAD_DOUBLE
   uint32_t pressTimestampMs;
 };
 
@@ -53,19 +61,22 @@ void radioTask(void *pvParameters) {
     if (xQueueReceive(radioMessageQueue, &message, portMAX_DELAY) == pdPASS) {
       uint32_t latencyMs = millis() - message.pressTimestampMs;
 
-      int state = radio.transmit(message.text);
+      Protocol::Frame frame = Protocol::buildButtonEvent(message.payload, Post::mask());
+      const char *label = (message.payload == Protocol::PAYLOAD_DOUBLE) ? "DOUBLE" : "SINGLE";
+
+      int state = radio.transmit(reinterpret_cast<uint8_t *>(&frame), Protocol::FRAME_SIZE);
 
       if (state == RADIOLIB_ERR_NONE) {
-        Serial.printf("[RadioTask] Sent: \"%s\" | press-to-send latency: %lu ms\n",
-                      message.text, (unsigned long)latencyMs);
+        LOGI("Sent %s seq=%u latency=%lums", label, frame.seq, (unsigned long)latencyMs);
+        Serial.printf("TX frame: %s\n", Protocol::toHex(frame).c_str());
 
         display.clear();
-        display.drawString(0, 0, "Sent:");
-        display.drawString(0, 16, message.text);
+        display.drawString(0, 0, "Sent: " + String(label));
+        display.drawString(0, 16, "seq: " + String(frame.seq));
         display.drawString(0, 40, "Latency: " + String(latencyMs) + " ms");
         display.display();
       } else {
-        Serial.printf("[RadioTask] Transmit failed, code %d\n", state);
+        LOGE("RadioTask transmit failed, code %d", state);
       }
     }
   }
@@ -99,13 +110,13 @@ void buttonTask(void *pvParameters) {
     }
 
     // Waiting window expired: decide single vs double and emit the event.
-    if (clickCount > 0 && (now - firstClickTime) > DOUBLE_CLICK_WINDOW_MS) {
+    // Read from Config on every check so a runtime `config set` takes effect immediately.
+    if (clickCount > 0 && (now - firstClickTime) > Config::get().doubleClickWindowMs) {
       ButtonEvent event;
       event.type = (clickCount >= 2) ? ClickType::DOUBLE : ClickType::SINGLE;
       event.pressTimestampMs = firstPressTimestamp;
 
-      Serial.printf("[ButtonTask] Detected %s click\n",
-                    event.type == ClickType::DOUBLE ? "DOUBLE" : "SINGLE");
+      LOGI("ButtonTask detected %s click", event.type == ClickType::DOUBLE ? "DOUBLE" : "SINGLE");
 
       xQueueSend(buttonEventQueue, &event, 0);
       clickCount = 0;
@@ -118,6 +129,10 @@ void buttonTask(void *pvParameters) {
 void setup() {
   Serial.begin(115200);
   delay(1000);
+
+  Log::init(LogLevel::LOG_DEBUG);
+  Version::print();
+  Config::load();
 
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
@@ -132,16 +147,20 @@ void setup() {
 
   loraSPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
   int state = radio.begin();
-  if (state != RADIOLIB_ERR_NONE) {
-    Serial.printf("[Setup] Radio init failed, code %d\n", state);
-    while (true) { delay(1000); }
+  bool radioInitOk = (state == RADIOLIB_ERR_NONE);
+  if (radioInitOk) {
+    radio.setOutputPower(Config::get().txPowerDbm);
+    LOGI("Radio initialized, txPower=%ddBm", Config::get().txPowerDbm);
+  } else {
+    LOGE("Radio init failed, code %d", state);
   }
-  Serial.println("[Setup] Radio initialized");
+
+  Post::run(radioInitOk, BUTTON_PIN, BATTERY_ADC_PIN);
 
   xTaskCreate(buttonTask, "ButtonTask", 4096, nullptr, 2, nullptr);
   xTaskCreate(radioTask, "RadioTask", 4096, nullptr, 1, nullptr);
 
-  Serial.println("[Setup] Ready. Press the external button (GPIO4) once or twice.");
+  LOGI("Ready. Press the external button (GPIO4) once or twice.");
 
   display.clear();
   display.drawString(0, 0, "Ready.");
@@ -150,22 +169,21 @@ void setup() {
 }
 
 // ---------- Main loop ----------
-// Blocks on buttonEventQueue (no polling, no busy-wait), decides which
-// packet to send based on click type, and hands it off to radioTask.
+// Waits on buttonEventQueue with a short timeout (not portMAX_DELAY) so the
+// CLI still gets polled between button events, decides which packet to send
+// based on click type, and hands it off to radioTask.
 void loop() {
+  Cli::poll();
+
   ButtonEvent event;
 
-  if (xQueueReceive(buttonEventQueue, &event, portMAX_DELAY) == pdPASS) {
+  if (xQueueReceive(buttonEventQueue, &event, pdMS_TO_TICKS(50)) == pdPASS) {
     RadioMessage message;
     message.pressTimestampMs = event.pressTimestampMs;
+    message.payload = (event.type == ClickType::SINGLE) ? Protocol::PAYLOAD_SINGLE
+                                                        : Protocol::PAYLOAD_DOUBLE;
 
-    if (event.type == ClickType::SINGLE) {
-      strcpy(message.text, "BUTTON SINGLE");
-    } else {
-      strcpy(message.text, "BUTTON DOUBLE");
-    }
-
-    Serial.printf("[MainLoop] Forwarding \"%s\" to RadioTask\n", message.text);
+    LOGI("MainLoop forwarding payload=0x%02X to RadioTask", message.payload);
     xQueueSend(radioMessageQueue, &message, 0);
   }
 }
